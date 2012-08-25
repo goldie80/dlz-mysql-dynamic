@@ -1,0 +1,5 @@
+libmysql-dynamic-bind9 (0.1) precise; urgency=low
+
+  * Initial release.
+
+ -- Mark Goldfinch <mark.goldfinch@g.org.nz>  Sat, 25 Aug 2012 20:16:24 +1200

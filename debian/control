@@ -1,0 +1,18 @@
+Source: libmysql-dynamic-bind9
+Maintainer: Mark Goldfinch <mark.goldfinch@g.org.nz>
+Section: net
+Priority: optional
+Standards-Version: 3.9.2
+Build-Depends: debhelper (>= 8), libmysqlclient-dev
+
+Package: libmysql-dynamic-bind9
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: DLZ dlopen() MySQL Driver for Bind 9
+ This is an attempt to port the original Bind 9 DLZ dlz_mysql_driver.c as
+ found in the Bind 9 source tree into the new DLZ dlopen driver
+ API. The goals of this project are as follows:
+ .
+ - Provide DLZ facilities to OEM-supported Bind distributions
+ - Support both v1 (Bind 9.8) and v2 (Bind 9.9) of the dlopen() DLZ
+   API
