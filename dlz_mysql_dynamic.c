@@ -52,10 +52,10 @@
 /* $Id$ */
 
 /*
- * This is simply a merge of Andrew Tridgell's dlz_example.c and the
- * original bdb_bdbhpt_driver.c
+ * This is a merge of Andrew Tridgell's dlz_example.c and the original
+ * dlz_mysql_driver.c
  *
- * This provides the externally loadable bdbhpt DLZ driver, without
+ * This provides the externally loadable MySQL DLZ driver, without
  * update support
  *
  */
@@ -66,179 +66,30 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-#include <db.h>
-
-#include "dlz_minimal.h"
-
-#ifdef WIN32
-#define STRTOK_R(a, b, c)	strtok_s(a, b, c)
-#elif defined(_REENTRANT)
-#define STRTOK_R(a, b, c)       strtok_r(a, b, c)
-#else
-#define STRTOK_R(a, b, c)       strtok(a, b)
+#ifdef USE_DLZ_LDOPEN_V1
+#include <dlz/dlz_ldopen_v1.h>
+#elsif USE_DLZ_LDOPEN_V2
+#include <dlz/dlz_ldopen_v2.h>
 #endif
 
-/* should the bdb driver use threads. */
-#ifdef ISC_PLATFORM_USETHREADS
-#define bdbhpt_threads DB_THREAD
-#else
-#define bdbhpt_threads 0
-#endif
+#include <dlz/sdlz_helper.h>
+#include <dlz/dlz_mysql_driver.h>
 
-/* bdbhpt database names */
-#define dlz_data   "dns_data"
-#define dlz_zone   "dns_zone"
-#define dlz_xfr    "dns_xfr"
-#define dlz_client "dns_client"
+#include <mysql.h>
 
-#define dlz_bdbhpt_dynamic_version "0.1"
+static dns_sdlzimplementation_t *dlz_mysql = NULL;
 
-/*
- * This structure contains all our DB handles and helper functions we
- * inherit from the dlz_dlopen driver
- *
- */
-typedef struct bdbhpt_instance {
-  DB_ENV    *dbenv;       /* bdbhpt environment */
-  DB        *data;        /* dns_data database handle */
-  DB        *zone;        /* zone database handle */
-  DB        *xfr;         /* zone xfr database handle */
-  DB        *client;      /* client database handle */
+#define dlz_mysql_dynamic_version "0.1"
 
-  /* Helper functions from the dlz_dlopen driver */
-  log_t *log;
-  dns_sdlz_putrr_t *putrr;
-  dns_sdlz_putnamedrr_t *putnamedrr;
-  dns_dlz_writeablezone_t *writeable_zone;
-} bdbhpt_instance_t;
+#define dbc_search_limit 30
+#define ALLNODES 1
+#define ALLOWXFR 2
+#define AUTHORITY 3
+#define FINDZONE 4
+#define COUNTZONE 5
+#define LOOKUP 6
 
-
-typedef struct bdbhpt_parsed_data {
-  char *host;
-  char *type;
-  int ttl;
-  char *data;
-} bdbhpt_parsed_data_t;
-
-/*
- * Reverses a string in place.
- */
-static char
-*bdbhpt_strrev(char *str) {
-  char *p1, *p2;
-  
-  if (! str || ! *str)
-    return str;
-  for (p1 = str, p2 = str + strlen(str) - 1; p2 > p1; ++p1, --p2) {
-    *p1 ^= *p2;
-    *p2 ^= *p1;
-    *p1 ^= *p2;
-  }
-  return str;
-}
-
-/*
- * Parses the DBT from the Berkeley DB into a parsed_data record
- * The parsed_data record should be allocated before and passed into the
- * bdbhpt_parse_data function.  The char (type & data) fields should not
- * be "free"d as that memory is part of the DBT data field.  It will be
- * "free"d when the DBT is freed.
- */
-static isc_result_t
-bdbhpt_parse_data(log_t *log, char *in, bdbhpt_parsed_data_t *pd) {
-  char *endp, *ttlStr;
-  char *tmp = in;
-  char *lastchar = (char *) &tmp[strlen(tmp)];
-  
-  /*
-   * String should be formatted as:
-   *   replication_id
-   *   (a space)
-   *   host_name
-   *   (a space)
-   *   ttl
-   *   (a space)
-   *   type
-   *   (a space)
-   *   remaining data
-   *
-   * examples:
-   *
-   * 9191 host 10 A 127.0.0.1
-   * server1_212 host 10 A 127.0.0.2
-   * {xxxx-xxxx-xxxx-xxxx-xxxx} host 10 MX 20 mail.example.com
-   */
-  
-  /*
-   * we don't need the replication id, so don't
-   * bother saving a pointer to it.
-   */
-  
-  /* find space after replication id */
-  tmp = strchr(tmp, ' ');
-  /* verify we found a space */
-  if (tmp == NULL)
-    return ISC_R_FAILURE;
-  /* make sure it is safe to increment pointer */
-  if (++tmp > lastchar)
-    return ISC_R_FAILURE;
-  
-  /* save pointer to host */
-  pd->host = tmp;
-  
-  /* find space after host and change it to a '\0' */
-  tmp = strchr(tmp, ' ');
-  /* verify we found a space */
-  if (tmp == NULL)
-    return ISC_R_FAILURE;
-  /* change the space to a null (string terminator) */
-  tmp[0] = '\0';
-  /* make sure it is safe to increment pointer */
-  if (++tmp > lastchar)
-    return ISC_R_FAILURE;
-  
-  /* save pointer to ttl string */
-  ttlStr = tmp;
-  
-  /* find space after ttl and change it to a '\0' */
-  tmp = strchr(tmp, ' ');
-  /* verify we found a space */
-  if (tmp == NULL)
-    return ISC_R_FAILURE;
-  /* change the space to a null (string terminator) */
-  tmp[0] = '\0';
-  /* make sure it is safe to increment pointer */
-  if (++tmp > lastchar)
-    return ISC_R_FAILURE;
-  
-  /* save pointer to dns type */
-  pd->type = tmp;
-  
-  /* find space after type and change it to a '\0' */
-  tmp = strchr(tmp, ' ');
-  /* verify we found a space */
-  if (tmp == NULL)
-    return ISC_R_FAILURE;
-  /* change the space to a null (string terminator) */
-  tmp[0] = '\0';
-  /* make sure it is safe to increment pointer */
-  if (++tmp > lastchar)
-    return ISC_R_FAILURE;
-  
-  /* save pointer to remainder of DNS data */
-  pd->data = tmp;
-  
-  /* convert ttl string to integer */
-  pd->ttl = strtol(ttlStr, &endp, 10);
-  if (*endp != '\0' || pd->ttl < 0) {
-    log(ISC_LOG_ERROR,
-        "bdbhpt_dynamic: ttl must be a positive number");
-    return ISC_R_FAILURE;
-  }
-  
-  /* if we get this far everything should have worked. */
-  return ISC_R_SUCCESS;
-}
+#define safeGet(in) in == NULL ? "" : in
 
 /*
  * Return the version of the API
@@ -253,7 +104,7 @@ dlz_version(unsigned int *flags) {
  * Remember a helper function from the bind9 dlz_dlopen driver
  */
 static void
-b9_add_helper(struct bdbhpt_instance *db,
+b9_add_helper(struct mysql_instance_t *db,
 	      const char *helper_name, void *ptr) {
   if (strcmp(helper_name, "log") == 0)
     db->log = (log_t *)ptr;
@@ -265,68 +116,402 @@ b9_add_helper(struct bdbhpt_instance *db,
     db->writeable_zone = (dns_dlz_writeablezone_t *)ptr;
 }
 
+
 /*
- * Performs bdbhpt cleanup.
- * Used by bdbhpt_create if there is an error starting up.
- * Used by bdbhpt_destroy when the driver is shutting down.
+ * Private methods
  */
-static void
-bdbhpt_cleanup(bdbhpt_instance_t *db) {
-  /* close databases */
-  if (db->data != NULL)
-    db->data->close(db->data, 0);
-  if (db->xfr != NULL)
-    db->xfr->close(db->xfr, 0);
-  if (db->zone != NULL)
-    db->zone->close(db->zone, 0);
-  if (db->client != NULL)
-    db->client->close(db->client, 0);
+
+/*
+ * Allocates memory for a new string, and then constructs the new
+ * string by "escaping" the input string.  The new string is
+ * safe to be used in queries.  This is necessary because we cannot
+ * be sure of what types of strings are passed to us, and we don't
+ * want special characters in the string causing problems.
+ */
+static char *
+mysqldrv_escape_string(MYSQL *mysql, const char *instr) {
+  char *outstr;
+  unsigned int len;
   
-  /* close environment */
-  if (db->dbenv != NULL)
-    db->dbenv->close(db->dbenv, 0);
+  if (instr == NULL)
+    return NULL;
+  
+  len = strlen(instr);
+
+  outstr = malloc((2 * len * sizeof(char)) + 1);
+  if (outstr == NULL)
+    return NULL;
+  
+  mysql_real_escape_string(mysql, outstr, instr, len);
+  
+  return outstr;
 }
 
 /*
- * Initialises, sets flags and then opens Berkeley databases.
- *
+ * This function is the real core of the driver.   Zone, record
+ * and client strings are passed in (or NULL is passed if the
+ * string is not available).  The type of query we want to run
+ * is indicated by the query flag, and the dbdata object is passed
+ * passed in to.  dbdata really holds a single database instance.
+ * The function will construct and run the query, hopefully getting
+ * a result set.
  */
 static isc_result_t
-bdbhpt_opendb(log_t *log, DB_ENV *db_env, DBTYPE db_type, DB **db, const char *db_name,
-              char *db_file, int flags) {
-  int result;
-
-  /* Initialise the database. */
-  if ((result = db_create(db, db_env, 0)) != 0) {
-    log(ISC_LOG_ERROR,
-        "bdbhpt_dynamic: could not initialize %s database. "
-        "BerkeleyDB error: %s",
-        db_name, db_strerror(result));
-    return ISC_R_FAILURE;
-  }
-
-  /* set database flags. */
-  if ((result = (*db)->set_flags(*db, flags)) != 0) {
-    log(ISC_LOG_ERROR,
-        "bdbhpt_dynamic: could not set flags for %s database. "
-        "BerkeleyDB error: %s",
-        db_name, db_strerror(result));
-    return ISC_R_FAILURE;
-  }
-
-  /* open the database. */
-  if ((result = (*db)->open(*db, NULL, db_file, db_name, db_type,
-                            DB_RDONLY | bdbhpt_threads, 0)) != 0) {
-    log(ISC_LOG_ERROR,
-        "bdbhpt_dynamic: could not open %s database in %s. "
-        "BerkeleyDB error: %s",
-        db_name, db_file, db_strerror(result));
-    return ISC_R_FAILURE;
+mysql_get_resultset(const char *zone, const char *record,
+		    const char *client, unsigned int query,
+		    void *dbdata, MYSQL_RES **rs) {
+  isc_result_t result;
+  mysql_instance_t *dbi = NULL;
+  char *querystring = NULL;
+  unsigned int i = 0;
+  unsigned int j = 0;
+  int qres = 0;
+  
+  if (query != COUNTZONE)
+    REQUIRE(*rs == NULL);
+  else
+    REQUIRE(rs == NULL);
+  
+  /* get db instance / connection */
+  dbi =  (mysql_instance_t *) dbdata;
+  
+  /* if DBI is null, can't do anything else */
+  if (dbi == NULL) {
+    result = ISC_R_FAILURE;
+    goto cleanup;
   }
   
-  return ISC_R_SUCCESS;
+  /* what type of query are we going to run? */
+  switch(query) {
+  case ALLNODES:
+    /*
+     * if the query was not passed in from the config file
+     * then we can't run it.  return not_implemented, so
+     * it's like the code for that operation was never
+     * built into the driver.... AHHH flexibility!!!
+     */
+    if (dbi->allnodes_q == NULL) {
+      result = ISC_R_NOTIMPLEMENTED;
+      goto cleanup;
+    }
+    break;
+  case ALLOWXFR:
+    /* same as comments as ALLNODES */
+    if (dbi->allowxfr_q == NULL) {
+      result = ISC_R_NOTIMPLEMENTED;
+      goto cleanup;
+    }
+    break;
+  case AUTHORITY:
+    /* same as comments as ALLNODES */
+    if (dbi->authority_q == NULL) {
+      result = ISC_R_NOTIMPLEMENTED;
+      goto cleanup;
+    }
+    break;
+  case FINDZONE:
+    /* this is required.  It's the whole point of DLZ! */
+    if (dbi->findzone_q == NULL) {
+      dbi->log(ISC_LOG_ERROR,
+               "No query specified for findzone.  "
+               "Findzone requires a query");
+      result = ISC_R_FAILURE;
+      goto cleanup;
+    }
+    break;
+  case COUNTZONE:
+    /* same as comments as ALLNODES */
+    if (dbi->countzone_q == NULL) {
+      result = ISC_R_NOTIMPLEMENTED;
+      goto cleanup;
+    }
+    break;
+  case LOOKUP:
+    /* this is required.  It's also a major point of DLZ! */
+    if (dbi->lookup_q == NULL) {
+      dbi->log(ISC_LOG_ERROR,
+               "No query specified for lookup.  "
+               "Lookup requires a query");
+      result = ISC_R_FAILURE;
+      goto cleanup;
+    }
+    break;
+  default:
+    /*
+     * this should never happen.  If it does, the code is
+     * screwed up!
+     */
+    UNEXPECTED_ERROR(__FILE__, __LINE__,
+                     "Incorrect query flag passed to "
+                     "mysql_get_resultset");
+    result = ISC_R_UNEXPECTED;
+    goto cleanup;
+  }
+  
+  
+  /*
+   * was a zone string passed?  If so, make it safe for use in
+   * queries.
+   */
+  if (zone != NULL) {
+    dbi->zone = mysqldrv_escape_string((MYSQL *) dbi->dbconn,
+                                       zone);
+    if (dbi->zone == NULL) {
+      result = ISC_R_NOMEMORY;
+      goto cleanup;
+    }
+  } else {	/* no string passed, set the string pointer to NULL */
+    dbi->zone = NULL;
+  }
+  
+  /*
+   * was a record string passed?  If so, make it safe for use in
+   * queries.
+   */
+  if (record != NULL) {
+    dbi->record = mysqldrv_escape_string((MYSQL *) dbi->dbconn,
+                                         record);
+    if (dbi->record == NULL) {
+      result = ISC_R_NOMEMORY;
+      goto cleanup;
+    }
+  } else {	/* no string passed, set the string pointer to NULL */
+    dbi->record = NULL;
+  }
+  
+  /*
+   * was a client string passed?  If so, make it safe for use in
+   * queries.
+   */
+  if (client != NULL) {
+    dbi->client = mysqldrv_escape_string((MYSQL *) dbi->dbconn,
+                                         client);
+    if (dbi->client == NULL) {
+      result = ISC_R_NOMEMORY;
+      goto cleanup;
+    }
+  } else {	/* no string passed, set the string pointer to NULL */
+    dbi->client = NULL;
+  }
+  
+  /*
+   * what type of query are we going to run?  this time we build
+   * the actual query to run.
+   */
+  switch(query) {
+  case ALLNODES:
+    querystring = build_querystring(dbi->allnodes_q);
+    break;
+  case ALLOWXFR:
+    querystring = build_querystring(dbi->allowxfr_q);
+    break;
+  case AUTHORITY:
+    querystring = build_querystring(dbi->authority_q);
+    break;
+  case FINDZONE:
+    querystring = build_querystring(dbi->findzone_q);
+    break;
+  case COUNTZONE:
+    querystring = build_querystring(dbi->countzone_q);
+    break;
+  case LOOKUP:
+    querystring = build_querystring(dbi->lookup_q);
+    break;
+  default:
+    /*
+     * this should never happen.  If it does, the code is
+     * screwed up!
+     */
+    UNEXPECTED_ERROR(__FILE__, __LINE__,
+                     "Incorrect query flag passed to "
+                     "mysql_get_resultset");
+    result = ISC_R_UNEXPECTED;
+    goto cleanup;
+  }
+  
+  /* if the querystring is null, Bummer, outta RAM.  UPGRADE TIME!!!   */
+  if (querystring == NULL) {
+    result = ISC_R_NOMEMORY;
+    goto cleanup;
+  }
+  
+  /*
+   * output the full query string during debug so we can see debug any
+   * SQL errors.
+   */
+  dbi->log(ISC_LOG_DEBUG(1),
+           "\nQuery String: %s\n", querystring);
+
+  /* attempt query up to 3 times. */
+  for (i=0; i < 3; i++) {
+    qres = mysql_query((MYSQL *) dbi->dbconn, querystring);
+    if (qres == 0)
+      break;
+    for (j=0; mysql_ping((MYSQL *) dbi->dbconn) != 0 && j < 4; j++)
+      ;
+  }
+
+  if (qres == 0) {
+    result = ISC_R_SUCCESS;
+    if (query != COUNTZONE) {
+      *rs = mysql_store_result((MYSQL *) dbi->dbconn);
+      if (*rs == NULL)
+        result = ISC_R_FAILURE;
+    }
+  } else {
+    result = ISC_R_FAILURE;
+  }
+
+ cleanup:
+  /* it's always good to cleanup after yourself */
+  
+  /* if we couldn't even get DBI, just return NULL */
+  if (dbi == NULL)
+    return ISC_R_FAILURE;
+  
+  /* free dbi->zone string */
+  if (dbi->zone != NULL)
+    free(dbi->zone);
+  
+  /* free dbi->record string */
+  if (dbi->record != NULL)
+    free(dbi->record);
+  
+  /* free dbi->client string */
+  if (dbi->client != NULL)
+    free(dbi->client);
+  
+  /* release query string */
+  if (querystring  != NULL)
+    free(querystring);
+  
+  /* return result */
+  return result;
 }
 
+/*
+ * The processing of result sets for lookup and authority are
+ * exactly the same.  So that functionality has been moved
+ * into this function to minimize code.
+ */
+static isc_result_t
+mysql_process_rs(mysql_instance_t *dbi, dns_sdlzlookup_t *lookup, MYSQL_RES *rs) {
+  isc_result_t result = ISC_R_NOTFOUND;
+  MYSQL_ROW row;
+  unsigned int fields;
+  unsigned int j;
+  unsigned int len;
+  char *tmpString;
+  char *endp;
+  int ttl;
+
+  row = mysql_fetch_row(rs);     /* get a row from the result set */
+  fields = mysql_num_fields(rs); /* how many columns in result set */
+  while (row != NULL) {
+    switch(fields) {
+    case 1:
+      /*
+       * one column in rs, it's the data field.  use
+       * default type of A record, and default TTL
+       * of 86400
+       */
+      result = dbi->dns_sdlz_putrr(lookup, "a", 86400,
+                                   safeGet(row[0]));
+      break;
+    case 2:
+      /*
+       * two columns, data field, and data type.
+       * use default TTL of 86400.
+       */
+      result = dbi->dns_sdlz_putrr(lookup, safeGet(row[0]), 86400,
+                                   safeGet(row[1]));
+      break;
+    case 3:
+      /*
+       * three columns, all data no defaults.
+       * convert text to int, make sure it worked
+       * right.
+       */
+      ttl = strtol(safeGet(row[0]), &endp, 10);
+      if (*endp != '\0' || ttl < 0) {
+        dbi->log(ISC_LOG_ERROR,
+                 "mysql driver ttl must be "
+                 "a postive number");
+      }
+      result = dbi->dns_sdlz_putrr(lookup, safeGet(row[1]), ttl,
+                                   safeGet(row[2]));
+      break;
+    default:
+      /*
+       * more than 3 fields, concatenate the last
+       * ones together.  figure out how long to make
+       * string.
+       */
+      for (j=2, len=0; j < fields; j++) {
+        len += strlen(safeGet(row[j])) + 1;
+      }
+      /*
+       * allocate string memory, allow for NULL to
+       * term string
+       */
+      tmpString = malloc(len + 1);
+      if (tmpString == NULL) {
+        /* major bummer, need more ram */
+        db->log(ISC_LOG_ERROR,
+                "mysql driver unable "
+                "to allocate memory for "
+                "temporary string");
+        mysql_free_result(rs);
+        return (ISC_R_FAILURE);	/* Yeah, I'd say! */
+      }
+      /* copy field to tmpString */
+      strcpy(tmpString, safeGet(row[2]));
+      
+      // YYY - current working point
+      
+      /*
+       * concat the rest of fields together, space
+       * between each one.
+       */
+      for (j=3; j < fields; j++) {
+        strcat(tmpString, " ");
+        strcat(tmpString, safeGet(row[j]));
+      }
+      /* convert text to int, make sure it worked right */
+      ttl = strtol(safeGet(row[0]), &endp, 10);
+      if (*endp != '\0' || ttl < 0) {
+        isc_log_write(dns_lctx,
+                      DNS_LOGCATEGORY_DATABASE,
+                      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
+                      "mysql driver ttl must be "
+                      "a postive number");
+      }
+      /* ok, now tell Bind about it. */
+      result = dns_sdlz_putrr(lookup, safeGet(row[1]),
+                              ttl, tmpString);
+      /* done, get rid of this thing. */
+      isc_mem_free(ns_g_mctx, tmpString);
+    }
+    /* I sure hope we were successful */
+    if (result != ISC_R_SUCCESS) {
+      /* nope, get rid of the Result set, and log a msg */
+      mysql_free_result(rs);
+      isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
+                    DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
+                    "dns_sdlz_putrr returned error. "
+                    "Error code was: %s",
+                    isc_result_totext(result));
+      return (ISC_R_FAILURE);
+    }
+    row = mysql_fetch_row(rs);	/* get next row */
+  }
+  
+  /* free result set memory */
+  mysql_free_result(rs);
+  
+  /* return result code */
+  return result;
+}
 
 /*
  * Called to initialize the driver
@@ -817,503 +1002,8 @@ dlz_allnodes(const char *zone, void *dbdata, dns_sdlzallnodes_t *allnodes) {
   
   return result;
 }
-/*
- * Copyright (C) 2002 Stichting NLnet, Netherlands, stichting@nlnet.nl.
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all
- * copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND STICHTING NLNET
- * DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
- * STICHTING NLNET BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
- * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
- * OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
- * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE
- * USE OR PERFORMANCE OF THIS SOFTWARE.
- *
- * The development of Dynamically Loadable Zones (DLZ) for Bind 9 was
- * conceived and contributed by Rob Butler.
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all
- * copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND ROB BUTLER
- * DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
- * ROB BUTLER BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
- * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
- * OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
- * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE
- * USE OR PERFORMANCE OF THIS SOFTWARE.
- */
 
-/*
- * Copyright (C) 1999-2001  Internet Software Consortium.
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND INTERNET SOFTWARE CONSORTIUM
- * DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
- * INTERNET SOFTWARE CONSORTIUM BE LIABLE FOR ANY SPECIAL, DIRECT,
- * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING
- * FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
- * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION
- * WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
-
-#ifdef DLZ_MYSQL
-
-#include <config.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-
-#include <dns/log.h>
-#include <dns/sdlz.h>
-#include <dns/result.h>
-
-#include <isc/mem.h>
-#include <isc/platform.h>
-#include <isc/print.h>
-#include <isc/result.h>
-#include <isc/string.h>
-#include <isc/util.h>
-
-#include <named/globals.h>
-
-#include <dlz/sdlz_helper.h>
-#include <dlz/dlz_mysql_driver.h>
-
-#include <mysql.h>
-
-static dns_sdlzimplementation_t *dlz_mysql = NULL;
-
-#define dbc_search_limit 30
-#define ALLNODES 1
-#define ALLOWXFR 2
-#define AUTHORITY 3
-#define FINDZONE 4
-#define COUNTZONE 5
-#define LOOKUP 6
-
-#define safeGet(in) in == NULL ? "" : in
-
-/*
- * Private methods
- */
-
-/*%
- * Allocates memory for a new string, and then constructs the new
- * string by "escaping" the input string.  The new string is
- * safe to be used in queries.  This is necessary because we cannot
- * be sure of what types of strings are passed to us, and we don't
- * want special characters in the string causing problems.
- */
-
-static char *
-mysqldrv_escape_string(MYSQL *mysql, const char *instr) {
-
-	char *outstr;
-	unsigned int len;
-
-	if (instr == NULL)
-		return NULL;
-
-	len = strlen(instr);
-
-	outstr = isc_mem_allocate(ns_g_mctx ,(2 * len * sizeof(char)) + 1);
-	if (outstr == NULL)
-		return NULL;
-
-	mysql_real_escape_string(mysql, outstr, instr, len);
-
-	return outstr;
-}
-
-/*%
- * This function is the real core of the driver.   Zone, record
- * and client strings are passed in (or NULL is passed if the
- * string is not available).  The type of query we want to run
- * is indicated by the query flag, and the dbdata object is passed
- * passed in to.  dbdata really holds a single database instance.
- * The function will construct and run the query, hopefully getting
- * a result set.
- */
-
-static isc_result_t
-mysql_get_resultset(const char *zone, const char *record,
-		    const char *client, unsigned int query,
-		    void *dbdata, MYSQL_RES **rs)
-{
-	isc_result_t result;
-	dbinstance_t *dbi = NULL;
-	char *querystring = NULL;
-	unsigned int i = 0;
-	unsigned int j = 0;
-	int qres = 0;
-
-	if (query != COUNTZONE)
-		REQUIRE(*rs == NULL);
-	else
-		REQUIRE(rs == NULL);
-
-	/* get db instance / connection */
-	dbi =  (dbinstance_t *) dbdata;
-
-	/* if DBI is null, can't do anything else */
-	if (dbi == NULL) {
-		result = ISC_R_FAILURE;
-		goto cleanup;
-	}
-
-	/* what type of query are we going to run? */
-	switch(query) {
-	case ALLNODES:
-		/*
-		 * if the query was not passed in from the config file
-		 * then we can't run it.  return not_implemented, so
-		 * it's like the code for that operation was never
-		 * built into the driver.... AHHH flexibility!!!
-		 */
-		if (dbi->allnodes_q == NULL) {
-			result = ISC_R_NOTIMPLEMENTED;
-			goto cleanup;
-		}
-		break;
-	case ALLOWXFR:
-		/* same as comments as ALLNODES */
-		if (dbi->allowxfr_q == NULL) {
-			result = ISC_R_NOTIMPLEMENTED;
-			goto cleanup;
-		}
-		break;
-	case AUTHORITY:
-		/* same as comments as ALLNODES */
-		if (dbi->authority_q == NULL) {
-			result = ISC_R_NOTIMPLEMENTED;
-			goto cleanup;
-		}
-		break;
-	case FINDZONE:
-		/* this is required.  It's the whole point of DLZ! */
-		if (dbi->findzone_q == NULL) {
-			isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
-				      DNS_LOGMODULE_DLZ, ISC_LOG_DEBUG(2),
-				      "No query specified for findzone.  "
-				      "Findzone requires a query");
-			result = ISC_R_FAILURE;
-			goto cleanup;
-		}
-		break;
-	case COUNTZONE:
-		/* same as comments as ALLNODES */
-		if (dbi->countzone_q == NULL) {
-			result = ISC_R_NOTIMPLEMENTED;
-			goto cleanup;
-		}
-		break;
-	case LOOKUP:
-		/* this is required.  It's also a major point of DLZ! */
-		if (dbi->lookup_q == NULL) {
-			isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
-				      DNS_LOGMODULE_DLZ, ISC_LOG_DEBUG(2),
-				      "No query specified for lookup.  "
-				      "Lookup requires a query");
-			result = ISC_R_FAILURE;
-			goto cleanup;
-		}
-		break;
-	default:
-		/*
-		 * this should never happen.  If it does, the code is
-		 * screwed up!
-		 */
-		UNEXPECTED_ERROR(__FILE__, __LINE__,
-				 "Incorrect query flag passed to "
-				 "mysql_get_resultset");
-		result = ISC_R_UNEXPECTED;
-		goto cleanup;
-	}
-
-
-	/*
-	 * was a zone string passed?  If so, make it safe for use in
-	 * queries.
-	 */
-	if (zone != NULL) {
-		dbi->zone = mysqldrv_escape_string((MYSQL *) dbi->dbconn,
-						   zone);
-		if (dbi->zone == NULL) {
-			result = ISC_R_NOMEMORY;
-			goto cleanup;
-		}
-	} else {	/* no string passed, set the string pointer to NULL */
-		dbi->zone = NULL;
-	}
-
-	/*
-	 * was a record string passed?  If so, make it safe for use in
-	 * queries.
-	 */
-	if (record != NULL) {
-		dbi->record = mysqldrv_escape_string((MYSQL *) dbi->dbconn,
-						     record);
-		if (dbi->record == NULL) {
-			result = ISC_R_NOMEMORY;
-			goto cleanup;
-		}
-	} else {	/* no string passed, set the string pointer to NULL */
-		dbi->record = NULL;
-	}
-
-	/*
-	 * was a client string passed?  If so, make it safe for use in
-	 * queries.
-	 */
-	if (client != NULL) {
-		dbi->client = mysqldrv_escape_string((MYSQL *) dbi->dbconn,
-						     client);
-		if (dbi->client == NULL) {
-			result = ISC_R_NOMEMORY;
-			goto cleanup;
-		}
-	} else {	/* no string passed, set the string pointer to NULL */
-		dbi->client = NULL;
-	}
-
-	/*
-	 * what type of query are we going to run?  this time we build
-	 * the actual query to run.
-	 */
-	switch(query) {
-	case ALLNODES:
-		querystring = build_querystring(ns_g_mctx, dbi->allnodes_q);
-		break;
-	case ALLOWXFR:
-		querystring = build_querystring(ns_g_mctx, dbi->allowxfr_q);
-		break;
-	case AUTHORITY:
-		querystring = build_querystring(ns_g_mctx, dbi->authority_q);
-		break;
-	case FINDZONE:
-		querystring = build_querystring(ns_g_mctx, dbi->findzone_q);
-		break;
-	case COUNTZONE:
-		querystring = build_querystring(ns_g_mctx, dbi->countzone_q);
-		break;
-	case LOOKUP:
-		querystring = build_querystring(ns_g_mctx, dbi->lookup_q);
-		break;
-	default:
-		/*
-		 * this should never happen.  If it does, the code is
-		 * screwed up!
-		 */
-		UNEXPECTED_ERROR(__FILE__, __LINE__,
-				 "Incorrect query flag passed to "
-				 "mysql_get_resultset");
-		result = ISC_R_UNEXPECTED;
-		goto cleanup;
-	}
-
-	/* if the querystring is null, Bummer, outta RAM.  UPGRADE TIME!!!   */
-	if (querystring == NULL) {
-		result = ISC_R_NOMEMORY;
-		goto cleanup;
-	}
-
-	/*
-	 * output the full query string during debug so we can see
-	 * what lame error the query has.
-	 */
-	isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
-		      DNS_LOGMODULE_DLZ, ISC_LOG_DEBUG(1),
-		      "\nQuery String: %s\n", querystring);
-
-	/* attempt query up to 3 times. */
-	for (i=0; i < 3; i++) {
-		qres = mysql_query((MYSQL *) dbi->dbconn, querystring);
-		if (qres == 0)
-			break;
-		for (j=0; mysql_ping((MYSQL *) dbi->dbconn) != 0 && j < 4; j++)
-			;
-	}
-
-	if (qres == 0) {
-		result = ISC_R_SUCCESS;
-		if (query != COUNTZONE) {
-			*rs = mysql_store_result((MYSQL *) dbi->dbconn);
-			if (*rs == NULL)
-				result = ISC_R_FAILURE;
-		}
-	} else {
-		result = ISC_R_FAILURE;
-	}
-
-
- cleanup:
-	/* it's always good to cleanup after yourself */
-
-	/* if we couldn't even get DBI, just return NULL */
-	if (dbi == NULL)
-		return ISC_R_FAILURE;
-
-	/* free dbi->zone string */
-	if (dbi->zone != NULL)
-		isc_mem_free(ns_g_mctx, dbi->zone);
-
-	/* free dbi->record string */
-	if (dbi->record != NULL)
-		isc_mem_free(ns_g_mctx, dbi->record);
-
-	/* free dbi->client string */
-	if (dbi->client != NULL)
-		isc_mem_free(ns_g_mctx, dbi->client);
-
-	/* release query string */
-	if (querystring  != NULL)
-		isc_mem_free(ns_g_mctx, querystring);
-
-	/* return result */
-	return result;
-}
-
-/*%
- * The processing of result sets for lookup and authority are
- * exactly the same.  So that functionality has been moved
- * into this function to minimize code.
- */
-
-static isc_result_t
-mysql_process_rs(dns_sdlzlookup_t *lookup, MYSQL_RES *rs)
-{
-	isc_result_t result = ISC_R_NOTFOUND;
-	MYSQL_ROW row;
-	unsigned int fields;
-	unsigned int j;
-	unsigned int len;
-	char *tmpString;
-	char *endp;
-	int ttl;
-
-	row = mysql_fetch_row(rs);	/* get a row from the result set */
-	fields = mysql_num_fields(rs);	/* how many columns in result set */
-	while (row != NULL) {
-		switch(fields) {
-		case 1:
-			/*
-			 * one column in rs, it's the data field.  use
-			 * default type of A record, and default TTL
-			 * of 86400
-			 */
-			result = dns_sdlz_putrr(lookup, "a", 86400,
-						safeGet(row[0]));
-			break;
-		case 2:
-			/*
-			 * two columns, data field, and data type.
-			 * use default TTL of 86400.
-			 */
-			result = dns_sdlz_putrr(lookup, safeGet(row[0]), 86400,
-						safeGet(row[1]));
-			break;
-		case 3:
-			/*
-			 * three columns, all data no defaults.
-			 * convert text to int, make sure it worked
-			 * right.
-			 */
-			ttl = strtol(safeGet(row[0]), &endp, 10);
-			if (*endp != '\0' || ttl < 0) {
-				isc_log_write(dns_lctx,
-					      DNS_LOGCATEGORY_DATABASE,
-					      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
-					      "mysql driver ttl must be "
-					      "a postive number");
-			}
-			result = dns_sdlz_putrr(lookup, safeGet(row[1]), ttl,
-						safeGet(row[2]));
-			break;
-		default:
-			/*
-			 * more than 3 fields, concatenate the last
-			 * ones together.  figure out how long to make
-			 * string.
-			 */
-			for (j=2, len=0; j < fields; j++) {
-				len += strlen(safeGet(row[j])) + 1;
-			}
-			/*
-			 * allocate string memory, allow for NULL to
-			 * term string
-			 */
-			tmpString = isc_mem_allocate(ns_g_mctx, len + 1);
-			if (tmpString == NULL) {
-				/* major bummer, need more ram */
-				isc_log_write(dns_lctx,
-					      DNS_LOGCATEGORY_DATABASE,
-					      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
-					      "mysql driver unable "
-					      "to allocate memory for "
-					      "temporary string");
-				mysql_free_result(rs);
-				return (ISC_R_FAILURE);	/* Yeah, I'd say! */
-			}
-			/* copy field to tmpString */
-			strcpy(tmpString, safeGet(row[2]));
-
-
-			/*
-			 * concat the rest of fields together, space
-			 * between each one.
-			 */
-			for (j=3; j < fields; j++) {
-				strcat(tmpString, " ");
-				strcat(tmpString, safeGet(row[j]));
-			}
-			/* convert text to int, make sure it worked right */
-			ttl = strtol(safeGet(row[0]), &endp, 10);
-			if (*endp != '\0' || ttl < 0) {
-				isc_log_write(dns_lctx,
-					      DNS_LOGCATEGORY_DATABASE,
-					      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
-					      "mysql driver ttl must be "
-					      "a postive number");
-			}
-			/* ok, now tell Bind about it. */
-			result = dns_sdlz_putrr(lookup, safeGet(row[1]),
-						ttl, tmpString);
-			/* done, get rid of this thing. */
-			isc_mem_free(ns_g_mctx, tmpString);
-		}
-		/* I sure hope we were successful */
-		if (result != ISC_R_SUCCESS) {
-			/* nope, get rid of the Result set, and log a msg */
-			mysql_free_result(rs);
-			isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
-				      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
-				      "dns_sdlz_putrr returned error. "
-				      "Error code was: %s",
-				      isc_result_totext(result));
-			return (ISC_R_FAILURE);
-		}
-		row = mysql_fetch_row(rs);	/* get next row */
-	}
-
-	/* free result set memory */
-	mysql_free_result(rs);
-
-	/* return result code */
-	return result;
-}
+// ZZZ - orig dlz_mysql_driver.c - ZZZ
 
 /*
  * SDLZ interface methods
@@ -1530,65 +1220,69 @@ mysql_allnodes(const char *zone, void *driverarg, void *dbdata,
 
 static isc_result_t
 mysql_authority(const char *zone, void *driverarg, void *dbdata,
-		dns_sdlzlookup_t *lookup)
-{
-	isc_result_t result;
-	MYSQL_RES *rs = NULL;
-
-	UNUSED(driverarg);
-
-	/* run the query and get the result set from the database. */
-	result = mysql_get_resultset(zone, NULL, NULL, AUTHORITY, dbdata, &rs);
-	/* if we get "not implemented", send it along */
-	if (result == ISC_R_NOTIMPLEMENTED)
-		return result;
-	/* if we didn't get a result set, log an err msg. */
-	if (result != ISC_R_SUCCESS) {
-		if (rs != NULL)
-			mysql_free_result(rs);
-		isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
-			      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
-			      "mysql driver unable to return "
-			      "result set for authority query");
-		return (ISC_R_FAILURE);
-	}
-	/*
-	 * lookup and authority result sets are processed in the same
-	 * manner mysql_process_rs does the job for both functions.
-	 */
-	return mysql_process_rs(lookup, rs);
+		dns_sdlzlookup_t *lookup) {
+  isc_result_t result;
+  MYSQL_RES *rs = NULL;
+  
+  mysql_instance_t *dbi = NULL;
+  dbi =  (mysql_instance_t *) dbdata;
+  
+  UNUSED(driverarg);
+  
+  /* run the query and get the result set from the database. */
+  result = mysql_get_resultset(zone, NULL, NULL, AUTHORITY, dbdata, &rs);
+  /* if we get "not implemented", send it along */
+  if (result == ISC_R_NOTIMPLEMENTED)
+    return result;
+  /* if we didn't get a result set, log an err msg. */
+  if (result != ISC_R_SUCCESS) {
+    if (rs != NULL)
+      mysql_free_result(rs);
+    isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
+                  DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
+                  "mysql driver unable to return "
+                  "result set for authority query");
+    return (ISC_R_FAILURE);
+  }
+  /*
+   * lookup and authority result sets are processed in the same
+   * manner mysql_process_rs does the job for both functions.
+   */
+  return mysql_process_rs(dbi, lookup, rs);
 }
 
 /*% if zone is supported, lookup up a (or multiple) record(s) in it */
 static isc_result_t
 mysql_lookup(const char *zone, const char *name, void *driverarg,
 	     void *dbdata, dns_sdlzlookup_t *lookup,
-	     dns_clientinfomethods_t *methods, dns_clientinfo_t *clientinfo)
-{
-	isc_result_t result;
-	MYSQL_RES *rs = NULL;
-
-	UNUSED(driverarg);
-	UNUSED(methods);
-	UNUSED(clientinfo);
-
-	/* run the query and get the result set from the database. */
-	result = mysql_get_resultset(zone, name, NULL, LOOKUP, dbdata, &rs);
-	/* if we didn't get a result set, log an err msg. */
-	if (result != ISC_R_SUCCESS) {
-		if (rs != NULL)
-			mysql_free_result(rs);
-		isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
-			      DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
-			      "mysql driver unable to return "
-			      "result set for lookup query");
-		return (ISC_R_FAILURE);
-	}
-	/*
-	 * lookup and authority result sets are processed in the same manner
-	 * mysql_process_rs does the job for both functions.
-	 */
-	return mysql_process_rs(lookup, rs);
+	     dns_clientinfomethods_t *methods, dns_clientinfo_t *clientinfo) {
+  isc_result_t result;
+  MYSQL_RES *rs = NULL;
+  
+  mysql_instance_t *dbi = NULL;
+  dbi =  (mysql_instance_t *) dbdata;
+  
+  UNUSED(driverarg);
+  UNUSED(methods);
+  UNUSED(clientinfo);
+  
+  /* run the query and get the result set from the database. */
+  result = mysql_get_resultset(zone, name, NULL, LOOKUP, dbdata, &rs);
+  /* if we didn't get a result set, log an err msg. */
+  if (result != ISC_R_SUCCESS) {
+    if (rs != NULL)
+      mysql_free_result(rs);
+    isc_log_write(dns_lctx, DNS_LOGCATEGORY_DATABASE,
+                  DNS_LOGMODULE_DLZ, ISC_LOG_ERROR,
+                  "mysql driver unable to return "
+                  "result set for lookup query");
+    return (ISC_R_FAILURE);
+  }
+  /*
+   * lookup and authority result sets are processed in the same manner
+   * mysql_process_rs does the job for both functions.
+   */
+  return mysql_process_rs(dbi, lookup, rs);
 }
 
 /*%

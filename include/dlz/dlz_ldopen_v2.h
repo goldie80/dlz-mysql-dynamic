@@ -54,6 +54,7 @@ typedef uint32_t dns_ttl_t;
 #define ISC_FALSE 0
 
 /* log levels */
+#define ISC_LOG_DEBUG(level)    (level)
 #define ISC_LOG_INFO		(-1)
 #define ISC_LOG_NOTICE		(-2)
 #define ISC_LOG_WARNING 	(-3)
