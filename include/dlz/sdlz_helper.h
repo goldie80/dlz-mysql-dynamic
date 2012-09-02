@@ -46,22 +46,21 @@
 
 typedef struct query_segment query_segment_t;
 typedef ISC_LIST(query_segment_t) query_list_t;
-typedef struct mysql_instance mysql_instance_t;
-typedef ISC_LIST(mysql_instance_t) db_list_t;
-typedef struct driverinstance driverinstance_t;
+typedef struct dbinstance dbinstance_t;
+typedef ISC_LIST(dbinstance_t) db_list_t;
 
-/*%
- * a query segment is all the text between our special tokens
- * special tokens are %zone%, %record%, %client%
- */
+/*
+* a query segment is all the text between our special tokens
+* special tokens are %zone%, %record%, %client%
+*/
 struct query_segment {
-	void				*sql;
-	unsigned int			strlen;
-	isc_boolean_t			direct;
-	ISC_LINK(query_segment_t)	link;
+  void				*sql;
+  unsigned int			strlen;
+  isc_boolean_t			direct;
+  ISC_LINK(query_segment_t)	link;
 };
 
-struct mysql_instance {
+struct dbinstance {
   void			  *dbconn;
   query_list_t		  *allnodes_q;
   query_list_t		  *allowxfr_q;
@@ -87,26 +86,27 @@ struct mysql_instance {
 
 /* see the code in sdlz_helper.c for more information on these methods */
 
+static void
+sdlz_destroy_querylist(query_list_t **querylist);
+
+static isc_result_t
+sdlzh_build_querylist(dbinstance_t *dbi, const char *query_str, char **zone,
+                      char **record, char **client, query_list_t **querylist,
+                      unsigned int flags);
+
 char *
-sdlzh_build_querystring(isc_mem_t *mctx, query_list_t *querylist);
+sdlzh_build_querystring(query_list_t *querylist);
 
 isc_result_t
-sdlzh_build_sqldbinstance(isc_mem_t *mctx, const char *allnodes_str,
-			  const char *allowxfr_str, const char *authority_str,
-			  const char *findzone_str, const char *lookup_str,
-			  const char *countzone_str, mysql_instance_t **dbi);
+sdlzh_build_sqldbinstance(const char *allnodes_str,
+                          const char *allowxfr_str, const char *authority_str,
+                          const char *findzone_str, const char *lookup_str,
+                          const char *countzone_str, dbinstance_t **dbi);
 
 void
-sdlzh_destroy_sqldbinstance(mysql_instance_t *dbi);
+sdlzh_destroy_sqldbinstance(dbinstance_t *dbi);
 
 char *
-sdlzh_get_parameter_value(isc_mem_t *mctx, const char *input, const char* key);
-
-/* Compatability with existing DLZ drivers */
-#define	build_querystring	sdlzh_build_querystring
-#define	build_sqldbinstance	sdlzh_build_sqldbinstance
-#define	destroy_sqldbinstance	sdlzh_destroy_sqldbinstance
-
-#define	getParameterValue(x,y)  sdlzh_get_parameter_value(ns_g_mctx, (x), (y))
+sdlzh_get_parameter_value(const char *input, const char* key);
 
 #endif /* SDLZHELPER_H */

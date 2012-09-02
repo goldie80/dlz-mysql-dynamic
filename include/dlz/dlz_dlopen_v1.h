@@ -23,7 +23,7 @@
   tree.
  */
 typedef unsigned int isc_result_t;
-typedef int isc_boolean_t;
+typedef enum { isc_boolean_false = 0, isc_boolean_true = 1 } isc_boolean_t;
 typedef uint32_t dns_ttl_t;
 
 #define DLZ_DLOPEN_VERSION 1
